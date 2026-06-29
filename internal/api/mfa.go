@@ -432,7 +432,6 @@ func (a *API) verifyTOTPFactor(w http.ResponseWriter, r *http.Request, params *V
 	factor := getFactor(ctx)
 	config := a.config
 	db := a.db.WithContext(ctx)
-	currentIP := utilities.GetIPAddress(r)
 
 	challenge, err := factor.FindChallengeByID(db, params.ChallengeID)
 	if err != nil && models.IsNotFoundError(err) {
@@ -441,9 +440,12 @@ func (a *API) verifyTOTPFactor(w http.ResponseWriter, r *http.Request, params *V
 		return internalServerError("Database error finding Challenge").WithInternalError(err)
 	}
 
-	// Ambiguous so as not to leak whether there is a verified challenge
-	if challenge.VerifiedAt != nil || challenge.IPAddress != currentIP {
-		return unprocessableEntityError(ErrorCodeMFAIPAddressMismatch, "Challenge and verify IP addresses mismatch")
+	// A challenge can only be verified once. We intentionally do NOT pin the
+	// verify request to the challenge's originating IP: legitimate clients
+	// routinely change source IP between challenge and verify (Cloudflare edge,
+	// IPv4/IPv6 dual-stack, mobile/NAT roaming), which rejected valid TOTP codes.
+	if challenge.VerifiedAt != nil {
+		return unprocessableEntityError(ErrorCodeMFAChallengeAlreadyVerified, "MFA challenge has already been verified")
 	}
 
 	if challenge.HasExpired(config.MFA.ChallengeExpiryDuration) {
@@ -570,7 +572,6 @@ func (a *API) verifyPhoneFactor(w http.ResponseWriter, r *http.Request, params *
 	user := getUser(ctx)
 	factor := getFactor(ctx)
 	db := a.db.WithContext(ctx)
-	currentIP := utilities.GetIPAddress(r)
 
 	challenge, err := factor.FindChallengeByID(db, params.ChallengeID)
 	if err != nil && models.IsNotFoundError(err) {
@@ -579,8 +580,10 @@ func (a *API) verifyPhoneFactor(w http.ResponseWriter, r *http.Request, params *
 		return internalServerError("Database error finding Challenge").WithInternalError(err)
 	}
 
-	if challenge.VerifiedAt != nil || challenge.IPAddress != currentIP {
-		return unprocessableEntityError(ErrorCodeMFAIPAddressMismatch, "Challenge and verify IP addresses mismatch")
+	// A challenge can only be verified once; IP pinning intentionally removed
+	// (see verifyTOTPFactor for rationale).
+	if challenge.VerifiedAt != nil {
+		return unprocessableEntityError(ErrorCodeMFAChallengeAlreadyVerified, "MFA challenge has already been verified")
 	}
 
 	if challenge.HasExpired(config.MFA.ChallengeExpiryDuration) {
