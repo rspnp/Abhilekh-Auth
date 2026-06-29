@@ -37,6 +37,7 @@ const (
 	ErrorCodeMFAFactorNameConflict             ErrorCode = "mfa_factor_name_conflict"
 	ErrorCodeMFAFactorNotFound                 ErrorCode = "mfa_factor_not_found"
 	ErrorCodeMFAIPAddressMismatch              ErrorCode = "mfa_ip_address_mismatch"
+	ErrorCodeMFAChallengeAlreadyVerified       ErrorCode = "mfa_challenge_already_verified"
 	ErrorCodeMFAChallengeExpired               ErrorCode = "mfa_challenge_expired"
 	ErrorCodeMFAVerificationFailed             ErrorCode = "mfa_verification_failed"
 	ErrorCodeMFAVerificationRejected           ErrorCode = "mfa_verification_rejected"
