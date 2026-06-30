@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 
+	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/supabase/auth/internal/conf"
 	"golang.org/x/oauth2"
 )
@@ -13,7 +14,23 @@ import (
 // Keycloak
 type keycloakProvider struct {
 	*oauth2.Config
-	Host string
+	Host        string
+	UserInfoURL string
+}
+
+// discoverOIDC resolves an OIDC provider via the issuer's discovery document.
+// go-oidc requires the discovered "issuer" to match the argument exactly; some
+// IdPs (e.g. Authentik) advertise the issuer WITH a trailing slash while Keycloak
+// does not, so we try the URL as given and then with the slash toggled.
+func discoverOIDC(ctx context.Context, issuer string) (*oidc.Provider, error) {
+	p, err := oidc.NewProvider(ctx, issuer)
+	if err == nil {
+		return p, nil
+	}
+	if strings.HasSuffix(issuer, "/") {
+		return oidc.NewProvider(ctx, strings.TrimSuffix(issuer, "/"))
+	}
+	return oidc.NewProvider(ctx, issuer+"/")
 }
 
 type keycloakUser struct {
@@ -46,13 +63,24 @@ func (u *keycloakUser) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// NewKeycloakProvider creates a Keycloak account provider.
-func NewKeycloakProvider(ext conf.OAuthProviderConfiguration, scopes string) (OAuthProvider, error) {
+// NewKeycloakProvider creates a Keycloak (or any OIDC-compliant IdP) provider.
+//
+// Endpoints are resolved via OIDC discovery (the issuer's
+// /.well-known/openid-configuration), so this works with non-Keycloak providers
+// such as Authentik whose endpoints are not under Keycloak's
+// /protocol/openid-connect/* paths. If the issuer does not serve a discovery
+// document, we fall back to the legacy Keycloak path layout for backwards
+// compatibility with existing Keycloak deployments.
+func NewKeycloakProvider(ctx context.Context, ext conf.OAuthProviderConfiguration, scopes string) (OAuthProvider, error) {
 	if err := ext.ValidateOAuth(); err != nil {
 		return nil, err
 	}
 
+	// "openid" is required: it marks this as an OIDC request so the IdP issues a
+	// token that can read userinfo. Authentik (strict OIDC) returns 403 from
+	// /userinfo without it; Keycloak is lenient but openid is still correct.
 	oauthScopes := []string{
+		"openid",
 		"profile",
 		"email",
 	}
@@ -65,9 +93,24 @@ func NewKeycloakProvider(ext conf.OAuthProviderConfiguration, scopes string) (OA
 		return nil, errors.New("unable to find URL for the Keycloak provider")
 	}
 
-	extURLlen := len(ext.URL)
-	if ext.URL[extURLlen-1] == '/' {
-		ext.URL = ext.URL[:extURLlen-1]
+	issuer := ext.URL
+	host := strings.TrimSuffix(ext.URL, "/")
+
+	// Legacy Keycloak defaults (fallback when discovery is unavailable).
+	authURL := host + "/protocol/openid-connect/auth"
+	tokenURL := host + "/protocol/openid-connect/token"
+	userInfoURL := host + "/protocol/openid-connect/userinfo"
+
+	// Prefer standards-based OIDC discovery.
+	if p, err := discoverOIDC(ctx, issuer); err == nil {
+		authURL = p.Endpoint().AuthURL
+		tokenURL = p.Endpoint().TokenURL
+		var meta struct {
+			UserInfoURL string `json:"userinfo_endpoint"`
+		}
+		if err := p.Claims(&meta); err == nil && meta.UserInfoURL != "" {
+			userInfoURL = meta.UserInfoURL
+		}
 	}
 
 	return &keycloakProvider{
@@ -75,13 +118,14 @@ func NewKeycloakProvider(ext conf.OAuthProviderConfiguration, scopes string) (OA
 			ClientID:     ext.ClientID[0],
 			ClientSecret: ext.Secret,
 			Endpoint: oauth2.Endpoint{
-				AuthURL:  ext.URL + "/protocol/openid-connect/auth",
-				TokenURL: ext.URL + "/protocol/openid-connect/token",
+				AuthURL:  authURL,
+				TokenURL: tokenURL,
 			},
 			RedirectURL: ext.RedirectURI,
 			Scopes:      oauthScopes,
 		},
-		Host: ext.URL,
+		Host:        host,
+		UserInfoURL: userInfoURL,
 	}, nil
 }
 
@@ -96,7 +140,7 @@ func (g keycloakProvider) RequiresPKCE() bool {
 func (g keycloakProvider) GetUserData(ctx context.Context, tok *oauth2.Token) (*UserProvidedData, error) {
 	var u keycloakUser
 
-	if err := makeRequest(ctx, tok, g.Config, g.Host+"/protocol/openid-connect/userinfo", &u); err != nil {
+	if err := makeRequest(ctx, tok, g.Config, g.UserInfoURL, &u); err != nil {
 		return nil, err
 	}
 
