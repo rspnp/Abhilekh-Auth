@@ -568,7 +568,7 @@ func (a *API) Provider(ctx context.Context, name string, scopes string) (provide
 	case "kakao":
 		return provider.NewKakaoProvider(config.External.Kakao, scopes)
 	case "keycloak":
-		return provider.NewKeycloakProvider(config.External.Keycloak, scopes)
+		return provider.NewKeycloakProvider(ctx, config.External.Keycloak, scopes)
 	case "linkedin":
 		return provider.NewLinkedinProvider(config.External.Linkedin, scopes)
 	case "linkedin_oidc":
