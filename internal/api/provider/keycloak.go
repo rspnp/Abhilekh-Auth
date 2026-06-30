@@ -52,7 +52,11 @@ func NewKeycloakProvider(ctx context.Context, ext conf.OAuthProviderConfiguratio
 		return nil, err
 	}
 
+	// "openid" is required: it marks this as an OIDC request so the IdP issues a
+	// token that can read the userinfo endpoint. Authentik (strict OIDC) returns
+	// 403 from /userinfo without it; Keycloak is lenient but openid is still correct.
 	oauthScopes := []string{
+		"openid",
 		"profile",
 		"email",
 	}
