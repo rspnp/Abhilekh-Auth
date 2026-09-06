@@ -2,11 +2,12 @@ package api
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"time"
 
 	"github.com/gofrs/uuid"
+	"github.com/sirupsen/logrus"
+	"github.com/supabase/auth/internal/api/apierrors"
 	"github.com/supabase/auth/internal/api/sms_provider"
 	"github.com/supabase/auth/internal/mailer"
 	"github.com/supabase/auth/internal/models"
@@ -23,6 +24,7 @@ type UserChangePasswordParams struct {
 type UserUpdateParams struct {
 	Email               string                 `json:"email"`
 	Password            *string                `json:"password"`
+	CurrentPassword     *string                `json:"current_password,omitempty"`
 	Nonce               string                 `json:"nonce"`
 	Data                map[string]interface{} `json:"data"`
 	AppData             map[string]interface{} `json:"app_metadata,omitempty"`
@@ -37,7 +39,7 @@ func (a *API) validateUserUpdateParams(ctx context.Context, p *UserUpdateParams)
 
 	var err error
 	if p.Email != "" {
-		p.Email, err = validateEmail(p.Email)
+		p.Email, err = a.validateEmail(p.Email)
 		if err != nil {
 			return err
 		}
@@ -51,7 +53,7 @@ func (a *API) validateUserUpdateParams(ctx context.Context, p *UserUpdateParams)
 			p.Channel = sms_provider.SMSProvider
 		}
 		if !sms_provider.IsValidMessageChannel(p.Channel, config) {
-			return badRequestError(ErrorCodeValidationFailed, InvalidChannelError)
+			return apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, InvalidChannelError)
 		}
 	}
 
@@ -69,13 +71,13 @@ func (a *API) UserGet(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	claims := getClaims(ctx)
 	if claims == nil {
-		return internalServerError("Could not read claims")
+		return apierrors.NewInternalServerError("Could not read claims")
 	}
 
 	aud := a.requestAud(ctx, r)
 	audienceFromClaims, _ := claims.GetAudience()
 	if len(audienceFromClaims) == 0 || aud != audienceFromClaims[0] {
-		return badRequestError(ErrorCodeValidationFailed, "Token audience doesn't match request audience")
+		return apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "Token audience doesn't match request audience")
 	}
 
 	user := getUser(ctx)
@@ -87,13 +89,13 @@ func (a *API) UserAuthInfoGet(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	claims := getClaims(ctx)
 	if claims == nil {
-		return internalServerError("Could not read claims")
+		return apierrors.NewInternalServerError("Could not read claims")
 	}
 
 	aud := a.requestAud(ctx, r)
 	audienceFromClaims, _ := claims.GetAudience()
 	if len(audienceFromClaims) == 0 || aud != audienceFromClaims[0] {
-		return badRequestError(ErrorCodeValidationFailed, "Token audience doesn't match request audience")
+		return apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "Token audience doesn't match request audience")
 	}
 
 	user := getUser(ctx)
@@ -118,10 +120,10 @@ func (a *API) UserChangePassword(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	if user.IsAnonymous {
-		return unprocessableEntityError(ErrorCodeUnknown, "Updating password of an anonymous user is not possible")
+		return apierrors.NewUnprocessableEntityError(apierrors.ErrorCodeUnknown, "Updating password of an anonymous user is not possible")
 	}
 	if user.IsSSOUser {
-		return unprocessableEntityError(ErrorCodeUnknown, "Updating password of an SSO user is not possible")
+		return apierrors.NewUnprocessableEntityError(apierrors.ErrorCodeUnknown, "Updating password of an SSO user is not possible")
 	}
 
 	password := params.Password
@@ -136,14 +138,14 @@ func (a *API) UserChangePassword(w http.ResponseWriter, r *http.Request) error {
 			return err
 		}
 		if !isCurrentPasswordCorrect {
-			return unprocessableEntityError(ErrorCodeIncorrectCurrentPassword, "Incorrect current password")
+			return apierrors.NewUnprocessableEntityError(apierrors.ErrorCodeIncorrectCurrentPassword, "Incorrect current password")
 		}
 		isSamePassword, _, err := user.Authenticate(ctx, db, password, config.Security.DBEncryption.DecryptionKeys, false, "")
 		if err != nil {
 			return err
 		}
 		if isSamePassword {
-			return unprocessableEntityError(ErrorCodeSamePassword, "New password should be different from the old password.")
+			return apierrors.NewUnprocessableEntityError(apierrors.ErrorCodeSamePassword, "New password should be different from the old password.")
 		}
 	}
 
@@ -159,10 +161,10 @@ func (a *API) UserChangePassword(w http.ResponseWriter, r *http.Request) error {
 		}
 
 		if terr = user.UpdatePassword(tx, sessionID); terr != nil {
-			return internalServerError("Error during password storage").WithInternalError(terr)
+			return apierrors.NewInternalServerError("Error during password storage").WithInternalError(terr)
 		}
 
-		if terr := models.NewAuditLogEntry(r, tx, user, models.UserUpdatePasswordAction, "", nil); terr != nil {
+		if terr := models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.UserUpdatePasswordAction, "", nil); terr != nil {
 			return terr
 		}
 
@@ -197,19 +199,25 @@ func (a *API) UserUpdate(w http.ResponseWriter, r *http.Request) error {
 
 	if params.AppData != nil && !isAdmin(user, config) {
 		if !isAdmin(user, config) {
-			return forbiddenError(ErrorCodeNotAdmin, "Updating app_metadata requires admin privileges")
+			return apierrors.NewForbiddenError(apierrors.ErrorCodeNotAdmin, "Updating app_metadata requires admin privileges")
+		}
+	}
+
+	if user.HasMFAEnabled() && !session.IsAAL2() {
+		if (params.Password != nil && *params.Password != "") || (params.Email != "" && user.GetEmail() != params.Email) || (params.Phone != "" && user.GetPhone() != params.Phone) {
+			return apierrors.NewHTTPError(http.StatusUnauthorized, apierrors.ErrorCodeInsufficientAAL, "AAL2 session is required to update email or password when MFA is enabled.")
 		}
 	}
 
 	if user.IsAnonymous {
-		updatingForbiddenFields := false
-		updatingForbiddenFields = updatingForbiddenFields || (params.Password != nil && *params.Password != "")
-		if updatingForbiddenFields {
-			// CHECK
-			return unprocessableEntityError(ErrorCodeUnknown, "Updating password of an anonymous user is not possible")
+		if params.Password != nil && *params.Password != "" {
+			if params.Email == "" && params.Phone == "" {
+				return apierrors.NewUnprocessableEntityError(apierrors.ErrorCodeValidationFailed, "Updating password of an anonymous user without an email or phone is not allowed")
+			}
 		}
 	}
 
+	// TODO: Check if a user is SSO via rows in identities table, not via this flag.
 	if user.IsSSOUser {
 		updatingForbiddenFields := false
 
@@ -219,23 +227,23 @@ func (a *API) UserUpdate(w http.ResponseWriter, r *http.Request) error {
 		updatingForbiddenFields = updatingForbiddenFields || (params.Nonce != "")
 
 		if updatingForbiddenFields {
-			return unprocessableEntityError(ErrorCodeUserSSOManaged, "Updating email, phone, password of a SSO account only possible via SSO")
+			return apierrors.NewUnprocessableEntityError(apierrors.ErrorCodeUserSSOManaged, "Updating email, phone, password of a SSO account only possible via SSO")
 		}
 	}
 
 	if params.Email != "" && user.GetEmail() != params.Email {
-		if duplicateUser, err := models.IsDuplicatedEmail(db, params.Email, aud, user); err != nil {
-			return internalServerError("Database error checking email").WithInternalError(err)
+		if duplicateUser, err := models.IsDuplicatedEmail(db, params.Email, aud, user, config.Experimental.ProvidersWithOwnLinkingDomain); err != nil {
+			return apierrors.NewInternalServerError("Database error checking email").WithInternalError(err)
 		} else if duplicateUser != nil {
-			return unprocessableEntityError(ErrorCodeEmailExists, DuplicateEmailMsg)
+			return apierrors.NewUnprocessableEntityError(apierrors.ErrorCodeEmailExists, DuplicateEmailMsg)
 		}
 	}
 
 	if params.Phone != "" && user.GetPhone() != params.Phone {
 		if exists, err := models.IsDuplicatedPhone(db, params.Phone, aud); err != nil {
-			return internalServerError("Database error checking phone").WithInternalError(err)
+			return apierrors.NewInternalServerError("Database error checking phone").WithInternalError(err)
 		} else if exists {
-			return unprocessableEntityError(ErrorCodePhoneExists, DuplicatePhoneMsg)
+			return apierrors.NewUnprocessableEntityError(apierrors.ErrorCodePhoneExists, DuplicatePhoneMsg)
 		}
 	}
 
@@ -245,7 +253,7 @@ func (a *API) UserUpdate(w http.ResponseWriter, r *http.Request) error {
 			// we require reauthentication if the user hasn't signed in recently in the current session
 			if session == nil || now.After(session.CreatedAt.Add(24*time.Hour)) {
 				if len(params.Nonce) == 0 {
-					return badRequestError(ErrorCodeReauthenticationNeeded, "Password update requires reauthentication")
+					return apierrors.NewBadRequestError(apierrors.ErrorCodeReauthenticationNeeded, "Password update requires reauthentication")
 				}
 				if err := a.verifyReauthentication(params.Nonce, db, config, user); err != nil {
 					return err
@@ -258,6 +266,31 @@ func (a *API) UserUpdate(w http.ResponseWriter, r *http.Request) error {
 			isSamePassword := false
 
 			if user.HasPassword() {
+				// current password required when updating password
+				if config.Security.UpdatePasswordRequireCurrentPassword {
+					// user may be in a password reset flow, where they do not have a currentPassword
+					isRecoverySession := false
+					for _, claim := range session.AMRClaims {
+						// password recovery flows can be via otp or a magic link, check if the current session
+						// was created with one of those
+						if claim.GetAuthenticationMethod() == "otp" || claim.GetAuthenticationMethod() == "magiclink" {
+							isRecoverySession = true
+							break
+						}
+					}
+					if !isRecoverySession {
+						if params.CurrentPassword == nil || *params.CurrentPassword == "" {
+							return apierrors.NewBadRequestError(apierrors.ErrorCodeCurrentPasswordRequired, "Current password required when setting new password.")
+						}
+						isCurrentPasswordCorrect, _, err := user.Authenticate(ctx, db, *params.CurrentPassword, config.Security.DBEncryption.DecryptionKeys, false, "")
+						if err != nil {
+							return err
+						}
+						if !isCurrentPasswordCorrect {
+							return apierrors.NewBadRequestError(apierrors.ErrorCodeCurrentPasswordMismatch, "Current password required when setting new password.")
+						}
+					}
+				}
 				auth, _, err := user.Authenticate(ctx, db, password, config.Security.DBEncryption.DecryptionKeys, false, "")
 				if err != nil {
 					return err
@@ -267,7 +300,7 @@ func (a *API) UserUpdate(w http.ResponseWriter, r *http.Request) error {
 			}
 
 			if isSamePassword {
-				return unprocessableEntityError(ErrorCodeSamePassword, "New password should be different from the old password.")
+				return apierrors.NewUnprocessableEntityError(apierrors.ErrorCodeSamePassword, "New password should be different from the old password.")
 			}
 		}
 
@@ -285,23 +318,31 @@ func (a *API) UserUpdate(w http.ResponseWriter, r *http.Request) error {
 			}
 
 			if terr = user.UpdatePassword(tx, sessionID); terr != nil {
-				return internalServerError("Error during password storage").WithInternalError(terr)
+				return apierrors.NewInternalServerError("Error during password storage").WithInternalError(terr)
 			}
 
-			if terr := models.NewAuditLogEntry(r, tx, user, models.UserUpdatePasswordAction, "", nil); terr != nil {
+			if terr := models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.UserUpdatePasswordAction, "", nil); terr != nil {
 				return terr
+			}
+
+			// send a Password Changed email notification to the user to inform them that their password has been changed
+			if config.Mailer.Notifications.PasswordChangedEnabled && user.GetEmail() != "" {
+				if err := a.sendPasswordChangedNotification(r, tx, user); err != nil {
+					// we don't want to fail the whole request if the email can't be sent
+					logrus.WithError(err).Warn("Unable to send password changed notification email")
+				}
 			}
 		}
 
 		if params.Data != nil {
 			if terr = user.UpdateUserMetaData(tx, params.Data); terr != nil {
-				return internalServerError("Error updating user").WithInternalError(terr)
+				return apierrors.NewInternalServerError("Error updating user").WithInternalError(terr)
 			}
 		}
 
 		if params.AppData != nil {
 			if terr = user.UpdateAppMetaData(tx, params.AppData); terr != nil {
-				return internalServerError("Error updating user").WithInternalError(terr)
+				return apierrors.NewInternalServerError("Error updating user").WithInternalError(terr)
 			}
 		}
 
@@ -327,10 +368,7 @@ func (a *API) UserUpdate(w http.ResponseWriter, r *http.Request) error {
 
 				}
 				if terr = a.sendEmailChange(r, tx, user, params.Email, flowType); terr != nil {
-					if errors.Is(terr, MaxFrequencyLimitError) {
-						return tooManyRequestsError(ErrorCodeOverEmailSendRateLimit, generateFrequencyLimitErrorMessage(user.EmailChangeSentAt, config.SMTP.MaxFrequency))
-					}
-					return internalServerError("Error sending change email").WithInternalError(terr)
+					return terr
 				}
 			}
 		}
@@ -351,8 +389,8 @@ func (a *API) UserUpdate(w http.ResponseWriter, r *http.Request) error {
 			}
 		}
 
-		if terr = models.NewAuditLogEntry(r, tx, user, models.UserModifiedAction, "", nil); terr != nil {
-			return internalServerError("Error recording audit log entry").WithInternalError(terr)
+		if terr = models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.UserModifiedAction, "", nil); terr != nil {
+			return apierrors.NewInternalServerError("Error recording audit log entry").WithInternalError(terr)
 		}
 
 		return nil

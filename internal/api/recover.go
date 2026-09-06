@@ -1,10 +1,10 @@
 package api
 
 import (
-	"errors"
 	"net/http"
 
 	"github.com/gofrs/uuid"
+	"github.com/supabase/auth/internal/api/apierrors"
 	"github.com/supabase/auth/internal/models"
 	"github.com/supabase/auth/internal/storage"
 )
@@ -16,12 +16,12 @@ type RecoverParams struct {
 	CodeChallengeMethod string `json:"code_challenge_method"`
 }
 
-func (p *RecoverParams) Validate() error {
+func (p *RecoverParams) Validate(a *API) error {
 	if p.Email == "" {
-		return badRequestError(ErrorCodeValidationFailed, "Password recovery requires an email")
+		return apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "Password recovery requires an email")
 	}
 	var err error
-	if p.Email, err = validateEmail(p.Email); err != nil {
+	if p.Email, err = a.validateEmail(p.Email); err != nil {
 		return err
 	}
 	if err := validatePKCEParams(p.CodeChallengeMethod, p.CodeChallenge); err != nil {
@@ -41,7 +41,7 @@ func (a *API) Recover(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	flowType := getFlowFromChallenge(params.CodeChallenge)
-	if err := params.Validate(); err != nil {
+	if err := params.Validate(a); err != nil {
 		return err
 	}
 
@@ -55,7 +55,7 @@ func (a *API) Recover(w http.ResponseWriter, r *http.Request) error {
 		if models.IsNotFoundError(err) {
 			return sendJSON(w, http.StatusOK, map[string]string{})
 		}
-		return internalServerError("Unable to process request").WithInternalError(err)
+		return apierrors.NewInternalServerError("Unable to process request").WithInternalError(err)
 	}
 	if isPKCEFlow(flowType) {
 		if _, err := generateFlowState(db, models.Recovery.String(), models.Recovery, params.CodeChallengeMethod, params.CodeChallenge, &(user.ID)); err != nil {
@@ -73,18 +73,15 @@ func (a *API) Recover(w http.ResponseWriter, r *http.Request) error {
 			sessionID = &session.ID
 		}
 		if terr := user.UpdatePassword(tx, sessionID); terr != nil {
-			return internalServerError("Error during resetting password").WithInternalError(terr)
+			return apierrors.NewInternalServerError("Error during resetting password").WithInternalError(terr)
 		}
-		if terr := models.NewAuditLogEntry(r, tx, user, models.UserRecoveryRequestedAction, "", nil); terr != nil {
+		if terr := models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.UserRecoveryRequestedAction, "", nil); terr != nil {
 			return terr
 		}
 		return a.sendPasswordRecovery(r, tx, user, flowType)
 	})
 	if err != nil {
-		if errors.Is(err, MaxFrequencyLimitError) {
-			return tooManyRequestsError(ErrorCodeOverEmailSendRateLimit, "For security purposes, you can only request this once every 60 seconds")
-		}
-		return internalServerError("Unable to process request").WithInternalError(err)
+		return err
 	}
 
 	return sendJSON(w, http.StatusOK, map[string]string{})

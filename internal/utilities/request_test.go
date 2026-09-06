@@ -7,9 +7,69 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"github.com/supabase/auth/internal/conf"
+	"github.com/supabase/auth/internal/sbff"
 )
 
-func TestGetIPAddress(t *tst.T) {
+func TestGetIPAddressWithSBFF(t *tst.T) {
+	testCases := []struct {
+		name       string
+		remoteAddr string
+		headerVal  string
+		expAddr    string
+	}{
+		{
+			name:       "ValidSBFF",
+			remoteAddr: "60.60.60.60",
+			headerVal:  "192.168.1.100",
+			expAddr:    "192.168.1.100",
+		},
+		{
+			name:       "MissingSBFF",
+			remoteAddr: "60.60.60.60",
+			headerVal:  "",
+			expAddr:    "60.60.60.60",
+		},
+		{
+			name:       "InvalidSBFF",
+			remoteAddr: "60.60.60.60",
+			headerVal:  "invalid",
+			expAddr:    "60.60.60.60",
+		},
+	}
+
+	config := conf.SecurityConfiguration{
+		SbForwardedForEnabled: true,
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *tst.T) {
+			var handler http.HandlerFunc = func(rw http.ResponseWriter, r *http.Request) {
+				obsAddr := GetIPAddress(r)
+				require.Equal(t, tc.expAddr, obsAddr)
+			}
+
+			errCallback := func(r *http.Request, err error) {
+			}
+
+			middleware := sbff.Middleware(&config, errCallback)
+
+			wrappedHandler := middleware(handler)
+
+			r := httptest.NewRequest(http.MethodGet, "http://localhost/", nil)
+
+			r.RemoteAddr = tc.remoteAddr
+
+			if tc.headerVal != "" {
+				r.Header.Set(sbff.HeaderName, tc.headerVal)
+			}
+
+			wrappedHandler.ServeHTTP(nil, r)
+		})
+
+	}
+}
+
+func TestGetIPAddressWithXFF(t *tst.T) {
 	examples := []func(r *http.Request) string{
 		func(r *http.Request) string {
 			r.Header = nil
@@ -91,7 +151,7 @@ func TestGetIPAddress(t *tst.T) {
 func TestGetReferrer(t *tst.T) {
 	config := conf.GlobalConfiguration{
 		SiteURL:      "https://example.com",
-		URIAllowList: []string{"http://localhost:8000/*"},
+		URIAllowList: []string{"http://localhost:8000/*", "http://*.localhost:8000/*", "http://*:12345/*", "http://**:12345/*"},
 		JWT: conf.JWTConfiguration{
 			Secret: "testsecret",
 		},
@@ -121,6 +181,41 @@ func TestGetReferrer(t *tst.T) {
 			desc:        "* respects separator",
 			redirectURL: "http://localhost:8000/path/to/page",
 			expected:    config.SiteURL,
+		},
+		{
+			desc:        "* respects parameters",
+			redirectURL: "http://localhost:8000/path?param=1",
+			expected:    "http://localhost:8000/path?param=1",
+		},
+		{
+			desc:        "invalid redirect url due to decimal IP address",
+			redirectURL: "http://123?.localhost:8000/path",
+			expected:    config.SiteURL,
+		},
+		{
+			desc:        "invalid redirect url due to IPv4 address",
+			redirectURL: "http://123.123.123.123?localhost:8000/path",
+			expected:    config.SiteURL,
+		},
+		{
+			desc:        "invalid redirect url due to IPv6 address",
+			redirectURL: "http://[65e7:9410:d8b6:e227:58cd:e55b:8fc0:206d]?localhost:8000/path",
+			expected:    config.SiteURL,
+		},
+		{
+			desc:        "invalid redirect url due to bad URL",
+			redirectURL: "http://65e7:9410:d8b6:e227:58cd:e55b:8fc0:206d?localhost:8000/path",
+			expected:    config.SiteURL,
+		},
+		{
+			desc:        "valid loopback IPv4 address",
+			redirectURL: "http://127.0.0.1:12345/path",
+			expected:    "http://127.0.0.1:12345/path",
+		},
+		{
+			desc:        "valid loopback IPv6 address",
+			redirectURL: "http://[0:0:0:0:0:0:0:1]:12345/path",
+			expected:    "http://[0:0:0:0:0:0:0:1]:12345/path",
 		},
 	}
 

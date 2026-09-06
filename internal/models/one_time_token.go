@@ -99,6 +99,10 @@ func (e OneTimeTokenNotFoundError) Error() string {
 	return "One-time token not found"
 }
 
+func (e OneTimeTokenNotFoundError) Is(target error) bool {
+	return target == errNotFound
+}
+
 type OneTimeToken struct {
 	ID uuid.UUID `json:"id" db:"id"`
 
@@ -155,7 +159,7 @@ func FindOneTimeToken(tx *storage.Connection, tokenHash string, tokenTypes ...On
 
 	switch len(tokenTypes) {
 	case 2:
-		query = query.Where("(token_type = ? or token_type = ?) and token_hash = ?", tokenTypes[0], tokenTypes[1], tokenHash)
+		query = query.Where("(token_type = ? or token_type = ?) and token_hash = ?", tokenTypes[0], tokenTypes[1], tokenHash) // #nosec G602
 
 	case 1:
 		query = query.Where("token_type = ? and token_hash = ?", tokenTypes[0], tokenHash)
@@ -218,7 +222,7 @@ func FindUserByEmailChangeToken(tx *storage.Connection, token string) (*User, er
 // FindUserByEmailChangeCurrentAndAudience finds a user with the matching email change and audience.
 func FindUserByEmailChangeCurrentAndAudience(tx *storage.Connection, email, token, aud string) (*User, error) {
 	ott, err := FindOneTimeToken(tx, token, EmailChangeTokenCurrent)
-	if err != nil {
+	if err != nil && !IsNotFoundError(err) {
 		return nil, err
 	}
 

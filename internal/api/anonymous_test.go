@@ -16,6 +16,7 @@ import (
 	"github.com/supabase/auth/internal/conf"
 	mail "github.com/supabase/auth/internal/mailer"
 	"github.com/supabase/auth/internal/models"
+	"github.com/supabase/auth/internal/storage"
 )
 
 type AnonymousTestSuite struct {
@@ -25,9 +26,14 @@ type AnonymousTestSuite struct {
 }
 
 func TestAnonymous(t *testing.T) {
-	api, config, err := setupAPIForTest()
-	require.NoError(t, err)
+	cb := func(cfg *conf.GlobalConfiguration, _ *storage.Connection) {
+		if cfg != nil {
+			cfg.RateLimitAnonymousUsers = 5
+		}
+	}
 
+	api, config, err := setupAPIForTestWithCallback(cb)
+	require.NoError(t, err)
 	ts := &AnonymousTestSuite{
 		API:    api,
 		Config: config,
@@ -80,7 +86,7 @@ func (ts *AnonymousTestSuite) TestAnonymousLogins() {
 
 func (ts *AnonymousTestSuite) TestConvertAnonymousUserToPermanent() {
 	ts.Config.External.AnonymousUsers.Enabled = true
-	ts.Config.Sms.TestOTP = map[string]string{"1234567890": "000000"}
+	ts.Config.Sms.TestOTP = map[string]string{"1234567890": "000000", "1234560000": "000000"}
 	// test OTPs still require setting up an sms provider
 	ts.Config.Sms.Provider = "twilio"
 	ts.Config.Sms.Twilio.AccountSid = "fake-sid"
@@ -103,6 +109,22 @@ func (ts *AnonymousTestSuite) TestConvertAnonymousUserToPermanent() {
 			desc: "convert anonymous user to permanent user with phone",
 			body: map[string]interface{}{
 				"phone": "1234567890",
+			},
+			verificationType: "phone_change",
+		},
+		{
+			desc: "convert anonymous user to permanent user with email & password",
+			body: map[string]interface{}{
+				"email":    "test2@example.com",
+				"password": "test-password",
+			},
+			verificationType: "email_change",
+		},
+		{
+			desc: "convert anonymous user to permanent user with phone & password",
+			body: map[string]interface{}{
+				"phone":    "1234560000",
+				"password": "test-password",
 			},
 			verificationType: "phone_change",
 		},
@@ -142,6 +164,11 @@ func (ts *AnonymousTestSuite) TestConvertAnonymousUserToPermanent() {
 			require.NotEmpty(ts.T(), user)
 			require.True(ts.T(), user.IsAnonymous)
 
+			// Check if user has a password set
+			if c.body["password"] != nil {
+				require.True(ts.T(), user.HasPassword())
+			}
+
 			switch c.verificationType {
 			case mail.EmailChangeVerification:
 				require.NoError(ts.T(), json.NewEncoder(&buffer).Encode(map[string]interface{}{
@@ -150,7 +177,7 @@ func (ts *AnonymousTestSuite) TestConvertAnonymousUserToPermanent() {
 				}))
 			case phoneChangeVerification:
 				require.NoError(ts.T(), json.NewEncoder(&buffer).Encode(map[string]interface{}{
-					"phone": "1234567890",
+					"phone": user.PhoneChange,
 					"token": "000000",
 					"type":  c.verificationType,
 				}))
@@ -176,11 +203,11 @@ func (ts *AnonymousTestSuite) TestConvertAnonymousUserToPermanent() {
 
 			switch c.verificationType {
 			case mail.EmailChangeVerification:
-				assert.Equal(ts.T(), "test@example.com", data.User.GetEmail())
+				assert.Equal(ts.T(), c.body["email"], data.User.GetEmail())
 				assert.Equal(ts.T(), models.JSONMap(models.JSONMap{"provider": "email", "providers": []interface{}{"email"}}), data.User.AppMetaData)
 				assert.NotEmpty(ts.T(), data.User.EmailConfirmedAt)
 			case phoneChangeVerification:
-				assert.Equal(ts.T(), "1234567890", data.User.GetPhone())
+				assert.Equal(ts.T(), c.body["phone"], data.User.GetPhone())
 				assert.Equal(ts.T(), models.JSONMap(models.JSONMap{"provider": "phone", "providers": []interface{}{"phone"}}), data.User.AppMetaData)
 				assert.NotEmpty(ts.T(), data.User.PhoneConfirmedAt)
 			}

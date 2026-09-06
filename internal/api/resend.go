@@ -1,12 +1,10 @@
 package api
 
 import (
-	"errors"
 	"net/http"
-	"time"
 
+	"github.com/supabase/auth/internal/api/apierrors"
 	"github.com/supabase/auth/internal/api/sms_provider"
-	"github.com/supabase/auth/internal/conf"
 	mail "github.com/supabase/auth/internal/mailer"
 	"github.com/supabase/auth/internal/models"
 	"github.com/supabase/auth/internal/storage"
@@ -14,41 +12,49 @@ import (
 
 // ResendConfirmationParams holds the parameters for a resend request
 type ResendConfirmationParams struct {
-	Type  string `json:"type"`
-	Email string `json:"email"`
-	Phone string `json:"phone"`
+	Type                string `json:"type"`
+	Email               string `json:"email"`
+	Phone               string `json:"phone"`
+	CodeChallenge       string `json:"code_challenge"`
+	CodeChallengeMethod string `json:"code_challenge_method"`
 }
 
-func (p *ResendConfirmationParams) Validate(config *conf.GlobalConfiguration) error {
+func (p *ResendConfirmationParams) Validate(a *API) error {
+	config := a.config
+
 	switch p.Type {
-	case mail.SignupVerification, mail.EmailChangeVerification, smsVerification, phoneChangeVerification:
+	case mail.SignupVerification, mail.EmailChangeVerification:
+		if err := validatePKCEParams(p.CodeChallengeMethod, p.CodeChallenge); err != nil {
+			return err
+		}
+	case smsVerification, phoneChangeVerification:
 		break
 	default:
 		// type does not match one of the above
-		return badRequestError(ErrorCodeValidationFailed, "Missing one of these types: signup, email_change, sms, phone_change")
+		return apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "Missing one of these types: signup, email_change, sms, phone_change")
 
 	}
 	if p.Email == "" && p.Type == mail.SignupVerification {
-		return badRequestError(ErrorCodeValidationFailed, "Type provided requires an email address")
+		return apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "Type provided requires an email address")
 	}
 	if p.Phone == "" && p.Type == smsVerification {
-		return badRequestError(ErrorCodeValidationFailed, "Type provided requires a phone number")
+		return apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "Type provided requires a phone number")
 	}
 
 	var err error
 	if p.Email != "" && p.Phone != "" {
-		return badRequestError(ErrorCodeValidationFailed, "Only an email address or phone number should be provided.")
+		return apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "Only an email address or phone number should be provided.")
 	} else if p.Email != "" {
 		if !config.External.Email.Enabled {
-			return badRequestError(ErrorCodeEmailProviderDisabled, "Email logins are disabled")
+			return apierrors.NewBadRequestError(apierrors.ErrorCodeEmailProviderDisabled, "Email logins are disabled")
 		}
-		p.Email, err = validateEmail(p.Email)
+		p.Email, err = a.validateEmail(p.Email)
 		if err != nil {
 			return err
 		}
 	} else if p.Phone != "" {
 		if !config.External.Phone.Enabled {
-			return badRequestError(ErrorCodePhoneProviderDisabled, "Phone logins are disabled")
+			return apierrors.NewBadRequestError(apierrors.ErrorCodePhoneProviderDisabled, "Phone logins are disabled")
 		}
 		p.Phone, err = validatePhone(p.Phone)
 		if err != nil {
@@ -56,7 +62,7 @@ func (p *ResendConfirmationParams) Validate(config *conf.GlobalConfiguration) er
 		}
 	} else {
 		// both email and phone are empty
-		return badRequestError(ErrorCodeValidationFailed, "Missing email address or phone number")
+		return apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "Missing email address or phone number")
 	}
 	return nil
 }
@@ -64,14 +70,14 @@ func (p *ResendConfirmationParams) Validate(config *conf.GlobalConfiguration) er
 // Recover sends a recovery email
 func (a *API) Resend(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
-	db := a.db.WithContext(ctx)
 	config := a.config
+	db := a.db.WithContext(ctx)
 	params := &ResendConfirmationParams{}
 	if err := retrieveRequestParams(r, params); err != nil {
 		return err
 	}
 
-	if err := params.Validate(config); err != nil {
+	if err := params.Validate(a); err != nil {
 		return err
 	}
 
@@ -88,7 +94,7 @@ func (a *API) Resend(w http.ResponseWriter, r *http.Request) error {
 		if models.IsNotFoundError(err) {
 			return sendJSON(w, http.StatusOK, map[string]string{})
 		}
-		return internalServerError("Unable to process request").WithInternalError(err)
+		return apierrors.NewInternalServerError("Unable to process request").WithInternalError(err)
 	}
 
 	switch params.Type {
@@ -118,13 +124,18 @@ func (a *API) Resend(w http.ResponseWriter, r *http.Request) error {
 	err = db.Transaction(func(tx *storage.Connection) error {
 		switch params.Type {
 		case mail.SignupVerification:
-			if terr := models.NewAuditLogEntry(r, tx, user, models.UserConfirmationRequestedAction, "", nil); terr != nil {
+			if terr := models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.UserConfirmationRequestedAction, "", nil); terr != nil {
 				return terr
 			}
-			// PKCE not implemented yet
-			return a.sendConfirmation(r, tx, user, models.ImplicitFlow)
+			flowType := getFlowFromChallenge(params.CodeChallenge)
+			if isPKCEFlow(flowType) {
+				if _, terr := generateFlowState(tx, models.EmailSignup.String(), models.EmailSignup, params.CodeChallengeMethod, params.CodeChallenge, &user.ID); terr != nil {
+					return terr
+				}
+			}
+			return a.sendConfirmation(r, tx, user, flowType)
 		case smsVerification:
-			if terr := models.NewAuditLogEntry(r, tx, user, models.UserRecoveryRequestedAction, "", nil); terr != nil {
+			if terr := models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.UserRecoveryRequestedAction, "", nil); terr != nil {
 				return terr
 			}
 			mID, terr := a.sendPhoneConfirmation(r, tx, user, params.Phone, phoneConfirmationOtp, sms_provider.SMSProvider)
@@ -133,7 +144,13 @@ func (a *API) Resend(w http.ResponseWriter, r *http.Request) error {
 			}
 			messageID = mID
 		case mail.EmailChangeVerification:
-			return a.sendEmailChange(r, tx, user, user.EmailChange, models.ImplicitFlow)
+			flowType := getFlowFromChallenge(params.CodeChallenge)
+			if isPKCEFlow(flowType) {
+				if _, terr := generateFlowState(tx, models.EmailChange.String(), models.EmailChange, params.CodeChallengeMethod, params.CodeChallenge, &user.ID); terr != nil {
+					return terr
+				}
+			}
+			return a.sendEmailChange(r, tx, user, user.EmailChange, flowType)
 		case phoneChangeVerification:
 			mID, terr := a.sendPhoneConfirmation(r, tx, user, user.PhoneChange, phoneChangeVerification, sms_provider.SMSProvider)
 			if terr != nil {
@@ -144,16 +161,7 @@ func (a *API) Resend(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	})
 	if err != nil {
-		if errors.Is(err, MaxFrequencyLimitError) {
-			reason := ErrorCodeOverEmailSendRateLimit
-			if params.Type == smsVerification || params.Type == phoneChangeVerification {
-				reason = ErrorCodeOverSMSSendRateLimit
-			}
-
-			until := time.Until(user.ConfirmationSentAt.Add(config.SMTP.MaxFrequency)) / time.Second
-			return tooManyRequestsError(reason, "For security purposes, you can only request this once every %d seconds.", until)
-		}
-		return internalServerError("Unable to process request").WithInternalError(err)
+		return err
 	}
 
 	ret := map[string]any{}
