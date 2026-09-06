@@ -1,36 +1,52 @@
 package models
 
 import (
-	"crypto/sha256"
-	"crypto/subtle"
 	"database/sql"
-	"encoding/base64"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/supabase/auth/internal/security"
 	"github.com/supabase/auth/internal/storage"
 
 	"github.com/gofrs/uuid"
 )
 
-const InvalidCodeChallengeError = "code challenge does not match previously saved code verifier"
-const InvalidCodeMethodError = "code challenge method not supported"
-
 type FlowState struct {
 	ID                   uuid.UUID  `json:"id" db:"id"`
 	UserID               *uuid.UUID `json:"user_id,omitempty" db:"user_id"`
-	AuthCode             string     `json:"auth_code" db:"auth_code"`
+	AuthCode             *string    `json:"auth_code,omitempty" db:"auth_code"`
 	AuthenticationMethod string     `json:"authentication_method" db:"authentication_method"`
-	CodeChallenge        string     `json:"code_challenge" db:"code_challenge"`
-	CodeChallengeMethod  string     `json:"code_challenge_method" db:"code_challenge_method"`
+	CodeChallenge        *string    `json:"code_challenge,omitempty" db:"code_challenge"`
+	CodeChallengeMethod  *string    `json:"code_challenge_method,omitempty" db:"code_challenge_method"`
 	ProviderType         string     `json:"provider_type" db:"provider_type"`
 	ProviderAccessToken  string     `json:"provider_access_token" db:"provider_access_token"`
 	ProviderRefreshToken string     `json:"provider_refresh_token" db:"provider_refresh_token"`
 	AuthCodeIssuedAt     *time.Time `json:"auth_code_issued_at" db:"auth_code_issued_at"`
 	CreatedAt            time.Time  `json:"created_at" db:"created_at"`
 	UpdatedAt            time.Time  `json:"updated_at" db:"updated_at"`
+
+	// OAuth context fields (previously stored in JWT state parameter)
+	InviteToken        *string    `json:"invite_token,omitempty" db:"invite_token"`
+	Referrer           *string    `json:"referrer,omitempty" db:"referrer"`
+	OAuthClientStateID *uuid.UUID `json:"oauth_client_state_id,omitempty" db:"oauth_client_state_id"`
+	LinkingTargetID    *uuid.UUID `json:"linking_target_id,omitempty" db:"linking_target_id"`
+	EmailOptional      bool       `json:"email_optional" db:"email_optional"`
+}
+
+// FlowStateParams contains all parameters for creating a flow state
+type FlowStateParams struct {
+	ProviderType         string
+	AuthenticationMethod AuthenticationMethod
+	CodeChallenge        string // empty for implicit flow
+	CodeChallengeMethod  string // empty for implicit flow
+	UserID               *uuid.UUID
+	InviteToken          string
+	Referrer             string
+	OAuthClientStateID   *uuid.UUID
+	LinkingTargetID      *uuid.UUID
+	EmailOptional        bool
 }
 
 type CodeChallengeMethod int
@@ -82,19 +98,50 @@ func (FlowState) TableName() string {
 	return tableName
 }
 
-func NewFlowState(providerType, codeChallenge string, codeChallengeMethod CodeChallengeMethod, authenticationMethod AuthenticationMethod, userID *uuid.UUID) *FlowState {
+// NewFlowState creates a flow state for both PKCE and implicit flows.
+// PKCE fields (AuthCode, CodeChallenge, CodeChallengeMethod) are only set
+// if CodeChallenge is provided in params.
+// Returns an error if CodeChallenge is provided but CodeChallengeMethod is invalid.
+func NewFlowState(params FlowStateParams) (*FlowState, error) {
 	id := uuid.Must(uuid.NewV4())
-	authCode := uuid.Must(uuid.NewV4())
+
 	flowState := &FlowState{
 		ID:                   id,
-		ProviderType:         providerType,
-		CodeChallenge:        codeChallenge,
-		CodeChallengeMethod:  codeChallengeMethod.String(),
-		AuthCode:             authCode.String(),
-		AuthenticationMethod: authenticationMethod.String(),
-		UserID:               userID,
+		ProviderType:         params.ProviderType,
+		AuthenticationMethod: params.AuthenticationMethod.String(),
+		UserID:               params.UserID,
+		EmailOptional:        params.EmailOptional,
+		OAuthClientStateID:   params.OAuthClientStateID,
+		LinkingTargetID:      params.LinkingTargetID,
 	}
-	return flowState
+
+	// Set PKCE fields only if code_challenge is provided
+	if params.CodeChallenge != "" {
+		codeChallengeMethod, err := ParseCodeChallengeMethod(params.CodeChallengeMethod)
+		if err != nil {
+			return nil, err
+		}
+		authCode := uuid.Must(uuid.NewV4()).String()
+		ccMethod := codeChallengeMethod.String()
+		flowState.AuthCode = &authCode
+		flowState.CodeChallenge = &params.CodeChallenge
+		flowState.CodeChallengeMethod = &ccMethod
+	}
+
+	// Set optional context fields
+	if params.InviteToken != "" {
+		flowState.InviteToken = &params.InviteToken
+	}
+	if params.Referrer != "" {
+		flowState.Referrer = &params.Referrer
+	}
+
+	return flowState, nil
+}
+
+// IsPKCE returns true if this flow state represents a PKCE flow
+func (f *FlowState) IsPKCE() bool {
+	return f.CodeChallenge != nil && *f.CodeChallenge != ""
 }
 
 func FindFlowStateByAuthCode(tx *storage.Connection, authCode string) (*FlowState, error) {
@@ -134,22 +181,10 @@ func FindFlowStateByUserID(tx *storage.Connection, id string, authenticationMeth
 }
 
 func (f *FlowState) VerifyPKCE(codeVerifier string) error {
-	switch f.CodeChallengeMethod {
-	case SHA256.String():
-		hashedCodeVerifier := sha256.Sum256([]byte(codeVerifier))
-		encodedCodeVerifier := base64.RawURLEncoding.EncodeToString(hashedCodeVerifier[:])
-		if subtle.ConstantTimeCompare([]byte(f.CodeChallenge), []byte(encodedCodeVerifier)) != 1 {
-			return errors.New(InvalidCodeChallengeError)
-		}
-	case Plain.String():
-		if subtle.ConstantTimeCompare([]byte(f.CodeChallenge), []byte(codeVerifier)) != 1 {
-			return errors.New(InvalidCodeChallengeError)
-		}
-	default:
-		return errors.New(InvalidCodeMethodError)
-
+	if !f.IsPKCE() {
+		return errors.New("PKCE verification not applicable for implicit flow")
 	}
-	return nil
+	return security.VerifyPKCEChallenge(*f.CodeChallenge, *f.CodeChallengeMethod, codeVerifier)
 }
 
 func (f *FlowState) IsExpired(expiryDuration time.Duration) bool {

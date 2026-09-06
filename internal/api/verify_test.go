@@ -8,10 +8,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/supabase/auth/internal/api/apierrors"
 	mail "github.com/supabase/auth/internal/mailer"
+	"github.com/supabase/auth/internal/mailer/mockclient"
+	"github.com/supabase/auth/internal/storage"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -25,15 +29,18 @@ type VerifyTestSuite struct {
 	suite.Suite
 	API    *API
 	Config *conf.GlobalConfiguration
+	Mailer mail.Mailer
 }
 
 func TestVerify(t *testing.T) {
-	api, config, err := setupAPIForTest()
+	mockMailer := &mockclient.MockMailer{}
+	api, config, err := setupAPIForTest(WithMailer(mockMailer))
 	require.NoError(t, err)
 
 	ts := &VerifyTestSuite{
 		API:    api,
 		Config: config,
+		Mailer: mockMailer,
 	}
 	defer api.db.Close()
 
@@ -47,6 +54,15 @@ func (ts *VerifyTestSuite) SetupTest() {
 	u, err := models.NewUser("12345678", "test@example.com", "password", ts.Config.JWT.Aud, nil)
 	require.NoError(ts.T(), err, "Error creating test user model")
 	require.NoError(ts.T(), ts.API.db.Create(u), "Error saving new test user")
+
+	// Create identity
+	i, err := models.NewIdentity(u, "email", map[string]interface{}{
+		"sub":            u.ID.String(),
+		"email":          "test@example.com",
+		"email_verified": false,
+	})
+	require.NoError(ts.T(), err, "Error creating test identity model")
+	require.NoError(ts.T(), ts.API.db.Create(i), "Error saving new test identity")
 }
 
 func (ts *VerifyTestSuite) TestVerifyPasswordRecovery() {
@@ -304,7 +320,7 @@ func (ts *VerifyTestSuite) TestExpiredConfirmationToken() {
 
 	f, err := url.ParseQuery(rurl.Fragment)
 	require.NoError(ts.T(), err)
-	assert.Equal(ts.T(), "403", f.Get("error_code"))
+	assert.Equal(ts.T(), apierrors.ErrorCodeOTPExpired, f.Get("error_code"))
 	assert.Equal(ts.T(), "Email link is invalid or has expired", f.Get("error_description"))
 	assert.Equal(ts.T(), "access_denied", f.Get("error"))
 }
@@ -641,6 +657,27 @@ func (ts *VerifyTestSuite) TestVerifySignupWithRedirectURLContainedPath() {
 			requestredirectURL:  "http://test.dev:3000/bar/foo",
 			expectedredirectURL: "http://localhost:3000",
 		},
+		{
+			desc:                "redirect ignores fragment for validation",
+			siteURL:             "http://localhost:3000",
+			uriAllowList:        []string{"http://*.example.com/*"},
+			requestredirectURL:  "http://something#.example.com/abc",
+			expectedredirectURL: "http://localhost:3000",
+		},
+		{
+			desc:                "redirect ignores unusual hostnames",
+			siteURL:             "http://localhost:3000",
+			uriAllowList:        []string{"http://*.example.com/*"},
+			requestredirectURL:  "http://japanese。.example.com/abc",
+			expectedredirectURL: "http://localhost:3000",
+		},
+		{
+			desc:                "redirect with allowed deep-link url correctly without a hostname",
+			siteURL:             "http://localhost:3000",
+			uriAllowList:        []string{"com.myapp://**"},
+			requestredirectURL:  "com.myapp://",
+			expectedredirectURL: "com.myapp:",
+		},
 	}
 
 	for _, tC := range testCases {
@@ -672,6 +709,8 @@ func (ts *VerifyTestSuite) TestVerifySignupWithRedirectURLContainedPath() {
 			u, err = models.FindUserByEmailAndAudience(ts.API.db, "test@example.com", ts.Config.JWT.Aud)
 			require.NoError(ts.T(), err)
 			assert.True(ts.T(), u.IsConfirmed())
+			assert.True(ts.T(), u.UserMetaData["email_verified"].(bool))
+			assert.True(ts.T(), u.Identities[0].IdentityData["email_verified"].(bool))
 		})
 	}
 }
@@ -720,7 +759,14 @@ func (ts *VerifyTestSuite) TestVerifyPKCEOTP() {
 
 			require.NoError(ts.T(), json.NewEncoder(&buffer).Encode(c.payload))
 			codeChallenge := "codechallengecodechallengcodechallengcodechallengcodechallenge"
-			flowState := models.NewFlowState(c.authenticationMethod.String(), codeChallenge, models.SHA256, c.authenticationMethod, &u.ID)
+			flowState, err := models.NewFlowState(models.FlowStateParams{
+				ProviderType:         c.authenticationMethod.String(),
+				AuthenticationMethod: c.authenticationMethod,
+				CodeChallenge:        codeChallenge,
+				CodeChallengeMethod:  "s256",
+				UserID:               &u.ID,
+			})
+			require.NoError(ts.T(), err)
 			require.NoError(ts.T(), ts.API.db.Create(flowState))
 
 			requestUrl := fmt.Sprintf("http://localhost/verify?type=%v&token=%v", c.payload.Type, c.payload.Token)
@@ -823,7 +869,7 @@ func (ts *VerifyTestSuite) TestVerifyBannedUser() {
 
 			f, err := url.ParseQuery(rurl.Fragment)
 			require.NoError(ts.T(), err)
-			assert.Equal(ts.T(), "403", f.Get("error_code"))
+			assert.Equal(ts.T(), apierrors.ErrorCodeUserBanned, f.Get("error_code"))
 		})
 	}
 }
@@ -875,6 +921,18 @@ func (ts *VerifyTestSuite) TestVerifyValidOtp() {
 			},
 		},
 		{
+			desc:     "Valid Signup Token Hash",
+			sentTime: time.Now(),
+			body: map[string]interface{}{
+				"type":       mail.SignupVerification,
+				"token_hash": crypto.GenerateTokenHash(u.GetEmail(), "123456"),
+			},
+			expected: expected{
+				code:      http.StatusOK,
+				tokenHash: crypto.GenerateTokenHash(u.GetEmail(), "123456"),
+			},
+		},
+		{
 			desc:     "Valid Recovery OTP",
 			sentTime: time.Now(),
 			body: map[string]interface{}{
@@ -894,6 +952,19 @@ func (ts *VerifyTestSuite) TestVerifyValidOtp() {
 				"type":  mail.EmailOTPVerification,
 				"token": "123456",
 				"email": u.GetEmail(),
+			},
+			expected: expected{
+				code:      http.StatusOK,
+				tokenHash: crypto.GenerateTokenHash(u.GetEmail(), "123456"),
+			},
+		},
+		{
+			desc:     "Valid Email OTP (email casing shouldn't matter)",
+			sentTime: time.Now(),
+			body: map[string]interface{}{
+				"type":  mail.EmailOTPVerification,
+				"token": "123456",
+				"email": strings.ToUpper(u.GetEmail()),
 			},
 			expected: expected{
 				code:      http.StatusOK,
@@ -924,18 +995,6 @@ func (ts *VerifyTestSuite) TestVerifyValidOtp() {
 			expected: expected{
 				code:      http.StatusOK,
 				tokenHash: crypto.GenerateTokenHash(u.PhoneChange, "123456"),
-			},
-		},
-		{
-			desc:     "Valid Signup Token Hash",
-			sentTime: time.Now(),
-			body: map[string]interface{}{
-				"type":       mail.SignupVerification,
-				"token_hash": crypto.GenerateTokenHash(u.GetEmail(), "123456"),
-			},
-			expected: expected{
-				code:      http.StatusOK,
-				tokenHash: crypto.GenerateTokenHash(u.GetEmail(), "123456"),
 			},
 		},
 		{
@@ -1096,28 +1155,28 @@ func (ts *VerifyTestSuite) TestPrepRedirectURL() {
 			message:  singleConfirmationAccepted,
 			rurl:     "https://example.com/?first=another&second=other",
 			flowType: models.PKCEFlow,
-			expected: fmt.Sprintf("https://example.com/?first=another&message=%s&second=other#message=%s", escapedMessage, escapedMessage),
+			expected: fmt.Sprintf("https://example.com/?first=another&message=%s&second=other#message=%s&sb=", escapedMessage, escapedMessage),
 		},
 		{
 			desc:     "(PKCE): Query params in redirect url are overriden",
 			message:  singleConfirmationAccepted,
 			rurl:     "https://example.com/?message=Valid+redirect+URL",
 			flowType: models.PKCEFlow,
-			expected: fmt.Sprintf("https://example.com/?message=%s#message=%s", escapedMessage, escapedMessage),
+			expected: fmt.Sprintf("https://example.com/?message=%s#message=%s&sb=", escapedMessage, escapedMessage),
 		},
 		{
 			desc:     "(Implicit): plain redirect url",
 			message:  singleConfirmationAccepted,
 			rurl:     "https://example.com/",
 			flowType: models.ImplicitFlow,
-			expected: fmt.Sprintf("https://example.com/#message=%s", escapedMessage),
+			expected: fmt.Sprintf("https://example.com/#message=%s&sb=", escapedMessage),
 		},
 		{
 			desc:     "(Implicit): query params retained",
 			message:  singleConfirmationAccepted,
 			rurl:     "https://example.com/?first=another",
 			flowType: models.ImplicitFlow,
-			expected: fmt.Sprintf("https://example.com/?first=another#message=%s", escapedMessage),
+			expected: fmt.Sprintf("https://example.com/?first=another#message=%s&sb=", escapedMessage),
 		},
 	}
 	for _, c := range cases {
@@ -1131,7 +1190,7 @@ func (ts *VerifyTestSuite) TestPrepRedirectURL() {
 
 func (ts *VerifyTestSuite) TestPrepErrorRedirectURL() {
 	const DefaultError = "Invalid redirect URL"
-	redirectError := fmt.Sprintf("error=invalid_request&error_code=400&error_description=%s", url.QueryEscape(DefaultError))
+	redirectError := fmt.Sprintf("error=invalid_request&error_code=validation_failed&error_description=%s", url.QueryEscape(DefaultError))
 
 	cases := []struct {
 		desc     string
@@ -1145,34 +1204,34 @@ func (ts *VerifyTestSuite) TestPrepErrorRedirectURL() {
 			message:  "Valid redirect URL",
 			rurl:     "https://example.com/",
 			flowType: models.PKCEFlow,
-			expected: fmt.Sprintf("https://example.com/?%s#%s", redirectError, redirectError),
+			expected: fmt.Sprintf("https://example.com/?%s#%s&sb=", redirectError, redirectError),
 		},
 		{
 			desc:     "(PKCE): Error with conflicting query params in redirect url",
 			message:  DefaultError,
 			rurl:     "https://example.com/?error=Error+to+be+overriden",
 			flowType: models.PKCEFlow,
-			expected: fmt.Sprintf("https://example.com/?%s#%s", redirectError, redirectError),
+			expected: fmt.Sprintf("https://example.com/?%s#%s&sb=", redirectError, redirectError),
 		},
 		{
 			desc:     "(Implicit): plain redirect url",
 			message:  DefaultError,
 			rurl:     "https://example.com/",
 			flowType: models.ImplicitFlow,
-			expected: fmt.Sprintf("https://example.com/#%s", redirectError),
+			expected: fmt.Sprintf("https://example.com/#%s&sb=", redirectError),
 		},
 		{
 			desc:     "(Implicit): query params preserved",
 			message:  DefaultError,
 			rurl:     "https://example.com/?test=param",
 			flowType: models.ImplicitFlow,
-			expected: fmt.Sprintf("https://example.com/?test=param#%s", redirectError),
+			expected: fmt.Sprintf("https://example.com/?test=param#%s&sb=", redirectError),
 		},
 	}
 	for _, c := range cases {
 		ts.Run(c.desc, func() {
 			req := httptest.NewRequest(http.MethodGet, "http://localhost", nil)
-			rurl, err := ts.API.prepErrorRedirectURL(badRequestError(ErrorCodeValidationFailed, DefaultError), req, c.rurl, c.flowType)
+			rurl, err := ts.API.prepErrorRedirectURL(apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, DefaultError), req, c.rurl, c.flowType)
 			require.NoError(ts.T(), err)
 			require.Equal(ts.T(), c.expected, rurl)
 		})
@@ -1222,7 +1281,7 @@ func (ts *VerifyTestSuite) TestVerifyValidateParams() {
 				Token: "some-token",
 			},
 			method:   http.MethodPost,
-			expected: badRequestError(ErrorCodeValidationFailed, "Only an email address or phone number should be provided on verify"),
+			expected: apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "Only an email address or phone number should be provided on verify"),
 		},
 		{
 			desc: "Cannot send both TokenHash and Token",
@@ -1232,7 +1291,7 @@ func (ts *VerifyTestSuite) TestVerifyValidateParams() {
 				TokenHash: "some-token-hash",
 			},
 			method:   http.MethodPost,
-			expected: badRequestError(ErrorCodeValidationFailed, "Verify requires either a token or a token hash"),
+			expected: apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "Verify requires either a token or a token hash"),
 		},
 		{
 			desc: "No verification type specified",
@@ -1241,15 +1300,285 @@ func (ts *VerifyTestSuite) TestVerifyValidateParams() {
 				Email: "email@example.com",
 			},
 			method:   http.MethodPost,
-			expected: badRequestError(ErrorCodeValidationFailed, "Verify requires a verification type"),
+			expected: apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "Verify requires a verification type"),
 		},
 	}
 
 	for _, c := range cases {
 		ts.Run(c.desc, func() {
 			req := httptest.NewRequest(c.method, "http://localhost", nil)
-			err := c.params.Validate(req)
+			err := c.params.Validate(req, ts.API)
 			require.Equal(ts.T(), c.expected, err)
 		})
 	}
+}
+
+func (ts *VerifyTestSuite) TestVeryEmailChangeSendsNotificationEmail() {
+	currentEmail := "test@example.com"
+	newEmail := "new@example.com"
+
+	// Change from new email to current email and back to new email
+	cases := []struct {
+		desc                        string
+		body                        map[string]interface{}
+		currentEmail                string
+		newEmail                    string
+		notificationEnabled         bool
+		expectedNotificationsCalled int
+	}{
+		{
+			desc: "Email change notification enabled",
+			body: map[string]interface{}{
+				"email": newEmail,
+			},
+			currentEmail:                currentEmail,
+			newEmail:                    newEmail,
+			notificationEnabled:         true,
+			expectedNotificationsCalled: 1,
+		},
+		{
+			desc: "Email change notification disabled",
+			body: map[string]interface{}{
+				"email": currentEmail,
+			},
+			currentEmail:                newEmail,
+			newEmail:                    currentEmail,
+			notificationEnabled:         false,
+			expectedNotificationsCalled: 0,
+		},
+	}
+
+	for _, c := range cases {
+		ts.Run(c.desc, func() {
+			ts.Config.Mailer.Notifications.EmailChangedEnabled = c.notificationEnabled
+			u, err := models.FindUserByEmailAndAudience(ts.API.db, c.currentEmail, ts.Config.JWT.Aud)
+			require.NoError(ts.T(), err)
+
+			// Get the mock mailer and reset it
+			mockMailer, ok := ts.Mailer.(*mockclient.MockMailer)
+			require.True(ts.T(), ok, "Mailer is not of type *MockMailer")
+			mockMailer.Reset()
+
+			// reset user
+			u.EmailChangeSentAt = nil
+			u.EmailChangeTokenCurrent = ""
+			u.EmailChangeTokenNew = ""
+			require.NoError(ts.T(), ts.API.db.Update(u))
+			require.NoError(ts.T(), models.ClearAllOneTimeTokensForUser(ts.API.db, u.ID))
+
+			// Request body
+			var buffer bytes.Buffer
+			require.NoError(ts.T(), json.NewEncoder(&buffer).Encode(c.body))
+
+			// Setup request
+			req := httptest.NewRequest(http.MethodPut, "http://localhost/user", &buffer)
+			req.Header.Set("Content-Type", "application/json")
+
+			// Generate access token for request and a mock session
+			var token string
+			session, err := models.NewSession(u.ID, nil)
+			require.NoError(ts.T(), err)
+			require.NoError(ts.T(), ts.API.db.Create(session))
+
+			token, _, err = ts.API.generateAccessToken(req, ts.API.db, u, &session.ID, models.MagicLink)
+			require.NoError(ts.T(), err)
+			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+
+			// Setup response recorder
+			w := httptest.NewRecorder()
+			ts.API.handler.ServeHTTP(w, req)
+			assert.Equal(ts.T(), http.StatusOK, w.Code)
+
+			u, err = models.FindUserByEmailAndAudience(ts.API.db, c.currentEmail, ts.Config.JWT.Aud)
+			require.NoError(ts.T(), err)
+
+			currentTokenHash := u.EmailChangeTokenCurrent
+			newTokenHash := u.EmailChangeTokenNew
+
+			u, err = models.FindUserByEmailAndAudience(ts.API.db, c.currentEmail, ts.Config.JWT.Aud)
+			require.NoError(ts.T(), err)
+
+			assert.WithinDuration(ts.T(), time.Now(), *u.EmailChangeSentAt, 1*time.Second)
+			assert.False(ts.T(), u.IsConfirmed())
+
+			// Verify new email
+			reqURL := fmt.Sprintf("http://localhost/verify?type=%s&token=%s", mail.EmailChangeVerification, newTokenHash)
+			req = httptest.NewRequest(http.MethodGet, reqURL, nil)
+
+			w = httptest.NewRecorder()
+			ts.API.handler.ServeHTTP(w, req)
+
+			u, err = models.FindUserByEmailAndAudience(ts.API.db, c.currentEmail, ts.Config.JWT.Aud)
+			require.NoError(ts.T(), err)
+			assert.Equal(ts.T(), singleConfirmation, u.EmailChangeConfirmStatus)
+
+			// Verify old email
+			reqURL = fmt.Sprintf("http://localhost/verify?type=%s&token=%s", mail.EmailChangeVerification, currentTokenHash)
+			req = httptest.NewRequest(http.MethodGet, reqURL, nil)
+
+			w = httptest.NewRecorder()
+			ts.API.handler.ServeHTTP(w, req)
+			require.Equal(ts.T(), http.StatusSeeOther, w.Code)
+
+			// user's email should've been updated to newEmail
+			u, err = models.FindUserByEmailAndAudience(ts.API.db, c.newEmail, ts.Config.JWT.Aud)
+			require.NoError(ts.T(), err)
+			require.Equal(ts.T(), zeroConfirmation, u.EmailChangeConfirmStatus)
+
+			// Assert that email change notification email was sent or not based on the instance's configuration
+			require.Len(ts.T(), mockMailer.EmailChangedMailCalls, c.expectedNotificationsCalled, fmt.Sprintf("Expected %d email change notification email(s) to be sent", c.expectedNotificationsCalled))
+			if c.expectedNotificationsCalled > 0 {
+				require.Equal(ts.T(), u.ID, mockMailer.EmailChangedMailCalls[0].User.ID, "Email should be sent to the correct user")
+				require.Equal(ts.T(), currentEmail, mockMailer.EmailChangedMailCalls[0].OldEmail, "Old email should match")
+			}
+
+			// Reset confirmation status after each test
+			u.EmailConfirmedAt = nil
+			require.NoError(ts.T(), ts.API.db.Update(u))
+		})
+	}
+}
+
+func (ts *VerifyTestSuite) TestVerifyPhoneChangeSendsNotificationEmailEnabled() {
+	ts.Config.Mailer.Notifications.PhoneChangedEnabled = true
+
+	u, err := models.FindUserByEmailAndAudience(ts.API.db, "test@example.com", ts.Config.JWT.Aud)
+	require.NoError(ts.T(), err)
+	u.Phone = "12345678"
+	u.PhoneChange = "1234567890"
+	require.NoError(ts.T(), ts.API.db.Update(u))
+
+	body := map[string]interface{}{
+		"type":  phoneChangeVerification,
+		"token": "123456",
+		"phone": u.PhoneChange,
+	}
+	sentTime := time.Now()
+	expectedTokenHash := crypto.GenerateTokenHash(u.PhoneChange, "123456")
+
+	// Get the mock mailer and reset it
+	mockMailer, ok := ts.Mailer.(*mockclient.MockMailer)
+	require.True(ts.T(), ok, "Mailer is not of type *MockMailer")
+	mockMailer.Reset()
+
+	// create user
+	require.NoError(ts.T(), models.ClearAllOneTimeTokensForUser(ts.API.db, u.ID))
+
+	u.PhoneChangeSentAt = &sentTime
+	u.PhoneChangeToken = expectedTokenHash
+
+	require.NoError(ts.T(), models.CreateOneTimeToken(ts.API.db, u.ID, "relates_to not used", u.PhoneChangeToken, models.PhoneChangeToken))
+	require.NoError(ts.T(), ts.API.db.Update(u))
+
+	var buffer bytes.Buffer
+	require.NoError(ts.T(), json.NewEncoder(&buffer).Encode(body))
+
+	// Setup request
+	req := httptest.NewRequest(http.MethodPost, "http://localhost/verify", &buffer)
+	req.Header.Set("Content-Type", "application/json")
+
+	// Setup response recorder
+	w := httptest.NewRecorder()
+	ts.API.handler.ServeHTTP(w, req)
+	assert.Equal(ts.T(), http.StatusOK, w.Code)
+
+	// Assert that phone change notification email was sent
+	require.Len(ts.T(), mockMailer.PhoneChangedMailCalls, 1, "Expected 1 phone change notification email(s) to be sent")
+	require.Equal(ts.T(), u.ID, mockMailer.PhoneChangedMailCalls[0].User.ID, "Email should be sent to the correct user")
+	require.Equal(ts.T(), "12345678", mockMailer.PhoneChangedMailCalls[0].OldPhone, "Old phone should match")
+	require.Equal(ts.T(), "test@example.com", mockMailer.PhoneChangedMailCalls[0].User.GetEmail(), "Email should be sent to the correct email address")
+}
+
+func (ts *VerifyTestSuite) TestVerifyPhoneChangeSendsNotificationEmailEnabled_NoChange() {
+	ts.Config.Mailer.Notifications.PhoneChangedEnabled = true
+
+	u, err := models.FindUserByEmailAndAudience(ts.API.db, "test@example.com", ts.Config.JWT.Aud)
+	require.NoError(ts.T(), err)
+	u.Phone = storage.NullString("")
+	u.PhoneChange = "1234567890"
+	require.NoError(ts.T(), ts.API.db.Update(u))
+
+	body := map[string]interface{}{
+		"type":  phoneChangeVerification,
+		"token": "123456",
+		"phone": u.PhoneChange,
+	}
+	sentTime := time.Now()
+	expectedTokenHash := crypto.GenerateTokenHash(u.PhoneChange, "123456")
+
+	// Get the mock mailer and reset it
+	mockMailer, ok := ts.Mailer.(*mockclient.MockMailer)
+	require.True(ts.T(), ok, "Mailer is not of type *MockMailer")
+	mockMailer.Reset()
+
+	// create user
+	require.NoError(ts.T(), models.ClearAllOneTimeTokensForUser(ts.API.db, u.ID))
+
+	u.PhoneChangeSentAt = &sentTime
+	u.PhoneChangeToken = expectedTokenHash
+
+	require.NoError(ts.T(), models.CreateOneTimeToken(ts.API.db, u.ID, "relates_to not used", u.PhoneChangeToken, models.PhoneChangeToken))
+	require.NoError(ts.T(), ts.API.db.Update(u))
+
+	var buffer bytes.Buffer
+	require.NoError(ts.T(), json.NewEncoder(&buffer).Encode(body))
+
+	// Setup request
+	req := httptest.NewRequest(http.MethodPost, "http://localhost/verify", &buffer)
+	req.Header.Set("Content-Type", "application/json")
+
+	// Setup response recorder
+	w := httptest.NewRecorder()
+	ts.API.handler.ServeHTTP(w, req)
+	assert.Equal(ts.T(), http.StatusOK, w.Code)
+
+	// Assert that phone change notification email was sent
+	require.Len(ts.T(), mockMailer.PhoneChangedMailCalls, 0, "Expected 0 phone change notification email(s) to be sent")
+}
+
+func (ts *VerifyTestSuite) TestVerifyPhoneChangeSendsNotificationEmailDisabled() {
+	ts.Config.Mailer.Notifications.PhoneChangedEnabled = false
+
+	u, err := models.FindUserByEmailAndAudience(ts.API.db, "test@example.com", ts.Config.JWT.Aud)
+	require.NoError(ts.T(), err)
+	u.Phone = "12345678"
+	u.PhoneChange = "1234567890"
+	require.NoError(ts.T(), ts.API.db.Update(u))
+
+	body := map[string]interface{}{
+		"type":  phoneChangeVerification,
+		"token": "123456",
+		"phone": u.PhoneChange,
+	}
+	sentTime := time.Now()
+	expectedTokenHash := crypto.GenerateTokenHash(u.PhoneChange, "123456")
+
+	// Get the mock mailer and reset it
+	mockMailer, ok := ts.Mailer.(*mockclient.MockMailer)
+	require.True(ts.T(), ok, "Mailer is not of type *MockMailer")
+	mockMailer.Reset()
+
+	// create user
+	require.NoError(ts.T(), models.ClearAllOneTimeTokensForUser(ts.API.db, u.ID))
+
+	u.PhoneChangeSentAt = &sentTime
+	u.PhoneChangeToken = expectedTokenHash
+
+	require.NoError(ts.T(), models.CreateOneTimeToken(ts.API.db, u.ID, "relates_to not used", u.PhoneChangeToken, models.PhoneChangeToken))
+	require.NoError(ts.T(), ts.API.db.Update(u))
+
+	var buffer bytes.Buffer
+	require.NoError(ts.T(), json.NewEncoder(&buffer).Encode(body))
+
+	// Setup request
+	req := httptest.NewRequest(http.MethodPost, "http://localhost/verify", &buffer)
+	req.Header.Set("Content-Type", "application/json")
+
+	// Setup response recorder
+	w := httptest.NewRecorder()
+	ts.API.handler.ServeHTTP(w, req)
+	assert.Equal(ts.T(), http.StatusOK, w.Code)
+
+	// Assert that phone change notification email was not sent
+	require.Len(ts.T(), mockMailer.PhoneChangedMailCalls, 0, "Expected 0 phone change notification email(s) to be sent")
 }

@@ -9,6 +9,7 @@ type ProviderSettings struct {
 	Bitbucket      bool `json:"bitbucket"`
 	Discord        bool `json:"discord"`
 	Facebook       bool `json:"facebook"`
+	Snapchat       bool `json:"snapchat"`
 	Figma          bool `json:"figma"`
 	Fly            bool `json:"fly"`
 	GitHub         bool `json:"github"`
@@ -38,6 +39,7 @@ type Settings struct {
 	SmsProvider       string           `json:"sms_provider"`
 	MFAEnabled        bool             `json:"mfa_enabled"` // preserve for backwards compatibility
 	SAMLEnabled       bool             `json:"saml_enabled"`
+	PasskeysEnabled   bool             `json:"passkeys_enabled"`
 }
 
 func (a *API) Settings(w http.ResponseWriter, r *http.Request) error {
@@ -51,6 +53,7 @@ func (a *API) Settings(w http.ResponseWriter, r *http.Request) error {
 			Bitbucket:      config.External.Bitbucket.Enabled,
 			Discord:        config.External.Discord.Enabled,
 			Facebook:       config.External.Facebook.Enabled,
+			Snapchat:       config.External.Snapchat.Enabled,
 			Figma:          config.External.Figma.Enabled,
 			Fly:            config.External.Fly.Enabled,
 			GitHub:         config.External.Github.Enabled,
@@ -76,5 +79,6 @@ func (a *API) Settings(w http.ResponseWriter, r *http.Request) error {
 		PhoneAutoconfirm:  config.Sms.Autoconfirm,
 		SmsProvider:       config.Sms.Provider,
 		SAMLEnabled:       config.SAML.Enabled,
+		PasskeysEnabled:   config.Passkey.Enabled,
 	})
 }

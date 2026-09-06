@@ -3,6 +3,7 @@ package api
 import (
 	"net/http"
 
+	"github.com/supabase/auth/internal/api/apierrors"
 	"github.com/supabase/auth/internal/metering"
 	"github.com/supabase/auth/internal/models"
 	"github.com/supabase/auth/internal/storage"
@@ -15,7 +16,7 @@ func (a *API) SignupAnonymously(w http.ResponseWriter, r *http.Request) error {
 	aud := a.requestAud(ctx, r)
 
 	if config.DisableSignup {
-		return unprocessableEntityError(ErrorCodeSignupDisabled, "Signups not allowed for this instance")
+		return apierrors.NewUnprocessableEntityError(apierrors.ErrorCodeSignupDisabled, "Signups not allowed for this instance")
 	}
 
 	params := &SignupParams{}
@@ -29,6 +30,9 @@ func (a *API) SignupAnonymously(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	if err := a.triggerBeforeUserCreated(r, db, newUser); err != nil {
+		return err
+	}
 
 	var grantParams models.GrantParams
 	grantParams.FillGrantParams(r)
@@ -40,19 +44,19 @@ func (a *API) SignupAnonymously(w http.ResponseWriter, r *http.Request) error {
 		if terr != nil {
 			return terr
 		}
-		token, terr = a.issueRefreshToken(r, tx, newUser, models.Anonymous, grantParams)
+		token, terr = a.issueRefreshToken(r, w.Header(), tx, newUser, models.Anonymous, grantParams)
 		if terr != nil {
-			return terr
-		}
-		if terr := a.setCookieTokens(config, token, false, w); terr != nil {
 			return terr
 		}
 		return nil
 	})
 	if err != nil {
-		return internalServerError("Database error creating anonymous user").WithInternalError(err)
+		return apierrors.NewInternalServerError("Database error creating anonymous user").WithInternalError(err)
+	}
+	if err := a.triggerAfterUserCreated(r, db, newUser); err != nil {
+		return err
 	}
 
-	metering.RecordLogin("anonymous", newUser.ID)
+	metering.RecordLogin(metering.LoginTypeAnonymous, newUser.ID, nil)
 	return sendJSON(w, http.StatusOK, token)
 }

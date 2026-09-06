@@ -11,6 +11,7 @@ import (
 	jwk "github.com/lestrrat-go/jwx/v2/jwk"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"github.com/supabase/auth/internal/api/apierrors"
 	"github.com/supabase/auth/internal/conf"
 	"github.com/supabase/auth/internal/models"
 )
@@ -54,6 +55,34 @@ func (ts *AuthTestSuite) TestExtractBearerToken() {
 	token, err := ts.API.extractBearerToken(req)
 	require.NoError(ts.T(), err)
 	require.Equal(ts.T(), userJwt, token)
+}
+
+// TestExtractBearerTokenCaseInsensitive verifies that the Bearer scheme
+// is matched case-insensitively per RFC 7235 §2.1.
+func TestExtractBearerTokenCaseInsensitive(t *testing.T) {
+	a := &API{}
+	token := "eyJhbGciOiJIUzI1NiJ9.e30.ZRrHA1JJJW8opB1Qfp7QDnH0sWd2N_gy0lsVOKiQ28"
+
+	cases := []struct {
+		scheme string
+	}{
+		{"Bearer"},
+		{"bearer"},
+		{"BEARER"},
+		{"bEaReR"},
+		{"BeArEr"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.scheme, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "http://localhost", nil)
+			req.Header.Set("Authorization", c.scheme+" "+token)
+
+			got, err := a.extractBearerToken(req)
+			require.NoError(t, err, "scheme %q should be accepted per RFC 7235 §2.1", c.scheme)
+			require.Equal(t, token, got)
+		})
+	}
 }
 
 func (ts *AuthTestSuite) TestParseJWTClaims() {
@@ -184,7 +213,7 @@ func (ts *AuthTestSuite) TestMaybeLoadUserOrSession() {
 				},
 				Role: "authenticated",
 			},
-			ExpectedError: forbiddenError(ErrorCodeBadJWT, "invalid claim: missing sub claim"),
+			ExpectedError: apierrors.NewForbiddenError(apierrors.ErrorCodeBadJWT, "invalid claim: missing sub claim"),
 			ExpectedUser:  nil,
 		},
 		{
@@ -206,7 +235,7 @@ func (ts *AuthTestSuite) TestMaybeLoadUserOrSession() {
 				},
 				Role: "authenticated",
 			},
-			ExpectedError: badRequestError(ErrorCodeBadJWT, "invalid claim: sub claim must be a UUID"),
+			ExpectedError: apierrors.NewBadRequestError(apierrors.ErrorCodeBadJWT, "invalid claim: sub claim must be a UUID"),
 			ExpectedUser:  nil,
 		},
 		{
@@ -255,7 +284,7 @@ func (ts *AuthTestSuite) TestMaybeLoadUserOrSession() {
 				Role:      "authenticated",
 				SessionId: "73bf9ee0-9e8c-453b-b484-09cb93e2f341",
 			},
-			ExpectedError:   forbiddenError(ErrorCodeSessionNotFound, "Session from session_id claim in JWT does not exist").WithInternalError(models.SessionNotFoundError{}).WithInternalMessage("session id (73bf9ee0-9e8c-453b-b484-09cb93e2f341) doesn't exist"),
+			ExpectedError:   apierrors.NewForbiddenError(apierrors.ErrorCodeSessionNotFound, "Session from session_id claim in JWT does not exist").WithInternalError(models.SessionNotFoundError{}).WithInternalMessage("session id (73bf9ee0-9e8c-453b-b484-09cb93e2f341) doesn't exist"),
 			ExpectedUser:    u,
 			ExpectedSession: nil,
 		},

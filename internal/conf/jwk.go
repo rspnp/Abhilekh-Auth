@@ -3,6 +3,7 @@ package conf
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/lestrrat-go/jwx/v2/jwk"
@@ -24,31 +25,53 @@ func (j *JwtKeysDecoder) Decode(value string) error {
 
 	config := JwtKeysDecoder{}
 	for _, key := range data {
-		privJwk, err := jwk.ParseKey(key)
-		if err != nil {
+		if err := j.decodeKey(config, key); err != nil {
 			return err
-		}
-		pubJwk, err := jwk.PublicKeyOf(privJwk)
-		if err != nil {
-			return err
-		}
-
-		// all public keys should have the the use claim set to 'sig
-		if err := pubJwk.Set(jwk.KeyUsageKey, "sig"); err != nil {
-			return err
-		}
-
-		// all public keys should only have 'verify' set as the key_ops
-		if err := pubJwk.Set(jwk.KeyOpsKey, jwk.KeyOperationList{jwk.KeyOpVerify}); err != nil {
-			return err
-		}
-
-		config[pubJwk.KeyID()] = JwkInfo{
-			PublicKey:  pubJwk,
-			PrivateKey: privJwk,
 		}
 	}
+
 	*j = config
+	return nil
+}
+
+func (j *JwtKeysDecoder) decodeKey(config JwtKeysDecoder, key []byte) error {
+	privJwk, err := jwk.ParseKey(key)
+	if err != nil {
+		return err
+	}
+	return j.decodePrivateKey(config, privJwk)
+}
+
+func (j *JwtKeysDecoder) decodePrivateKey(
+	config JwtKeysDecoder,
+	privJwk jwk.Key,
+) error {
+	pubJwk, err := jwk.PublicKeyOf(privJwk)
+	if err != nil {
+		return err
+	}
+	return j.decodePublicKey(config, privJwk, pubJwk)
+}
+
+func (j *JwtKeysDecoder) decodePublicKey(
+	config JwtKeysDecoder,
+	privJwk jwk.Key,
+	pubJwk jwk.Key,
+) error {
+	// all public keys should have the the use claim set to 'sig
+	if err := pubJwk.Set(jwk.KeyUsageKey, "sig"); err != nil {
+		return err
+	}
+
+	// all public keys should only have 'verify' set as the key_ops
+	if err := pubJwk.Set(jwk.KeyOpsKey, jwk.KeyOperationList{jwk.KeyOpVerify}); err != nil {
+		return err
+	}
+
+	config[pubJwk.KeyID()] = JwkInfo{
+		PublicKey:  pubJwk,
+		PrivateKey: privJwk,
+	}
 	return nil
 }
 
@@ -75,11 +98,8 @@ func (j *JwtKeysDecoder) Validate() error {
 			}
 		}
 
-		for _, op := range key.PrivateKey.KeyOps() {
-			if op == jwk.KeyOpSign {
-				signingKeys = append(signingKeys, key.PrivateKey)
-				break
-			}
+		if slices.Contains(key.PrivateKey.KeyOps(), jwk.KeyOpSign) {
+			signingKeys = append(signingKeys, key.PrivateKey)
 		}
 	}
 
@@ -95,11 +115,9 @@ func (j *JwtKeysDecoder) Validate() error {
 
 func GetSigningJwk(config *JWTConfiguration) (jwk.Key, error) {
 	for _, key := range config.Keys {
-		for _, op := range key.PrivateKey.KeyOps() {
-			// the private JWK with key_ops "sign" should be used as the signing key
-			if op == jwk.KeyOpSign {
-				return key.PrivateKey, nil
-			}
+		// the private JWK with key_ops "sign" should be used as the signing key
+		if slices.Contains(key.PrivateKey.KeyOps(), jwk.KeyOpSign) {
+			return key.PrivateKey, nil
 		}
 	}
 	return nil, fmt.Errorf("no signing key found")
@@ -146,5 +164,7 @@ func FindPublicKeyByKid(kid string, config *JWTConfiguration) (any, error) {
 	if kid == config.KeyID {
 		return []byte(config.Secret), nil
 	}
-	return nil, fmt.Errorf("invalid kid: %s", kid)
+
+	// don't return error, as a fallback key might be used
+	return nil, nil
 }

@@ -1,7 +1,7 @@
 package cmd
 
 import (
-	"fmt"
+	"embed"
 	"net/url"
 	"os"
 
@@ -12,6 +12,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var EmbeddedMigrations embed.FS
+
 var migrateCmd = cobra.Command{
 	Use:  "migrate",
 	Long: "Migrate database strucutures. This will create new tables and add missing columns and indexes.",
@@ -20,12 +22,12 @@ var migrateCmd = cobra.Command{
 
 func migrate(cmd *cobra.Command, args []string) {
 	globalConfig := loadGlobalConfig(cmd.Context())
+	u, err := url.Parse(globalConfig.DB.URL)
+	if err != nil {
+		logrus.Fatalf("%+v", errors.Wrap(err, "parsing db connection url"))
+	}
 
 	if globalConfig.DB.Driver == "" && globalConfig.DB.URL != "" {
-		u, err := url.Parse(globalConfig.DB.URL)
-		if err != nil {
-			logrus.Fatalf("%+v", errors.Wrap(err, "parsing db connection url"))
-		}
 		globalConfig.DB.Driver = u.Scheme
 	}
 
@@ -50,16 +52,12 @@ func migrate(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	u, _ := url.Parse(globalConfig.DB.URL)
-	processedUrl := globalConfig.DB.URL
-	if len(u.Query()) != 0 {
-		processedUrl = fmt.Sprintf("%s&application_name=gotrue_migrations", processedUrl)
-	} else {
-		processedUrl = fmt.Sprintf("%s?application_name=gotrue_migrations", processedUrl)
-	}
+	q := u.Query()
+	q.Add("application_name", "auth_migrations")
+	u.RawQuery = q.Encode()
 	deets := &pop.ConnectionDetails{
 		Dialect: globalConfig.DB.Driver,
-		URL:     processedUrl,
+		URL:     u.String(),
 	}
 	deets.Options = map[string]string{
 		"migration_table_name": "schema_migrations",
@@ -76,11 +74,14 @@ func migrate(cmd *cobra.Command, args []string) {
 		log.Fatalf("%+v", errors.Wrap(err, "checking database connection"))
 	}
 
-	log.Debugf("Reading migrations from %s", globalConfig.DB.MigrationsPath)
-	mig, err := pop.NewFileMigrator(globalConfig.DB.MigrationsPath, db)
+	log.Debugf("Reading migrations from executable")
+	box, err := pop.NewMigrationBox(EmbeddedMigrations, db)
 	if err != nil {
 		log.Fatalf("%+v", errors.Wrap(err, "creating db migrator"))
 	}
+
+	mig := box.Migrator
+
 	log.Debugf("before status")
 
 	if log.Level == logrus.DebugLevel {
@@ -93,11 +94,11 @@ func migrate(cmd *cobra.Command, args []string) {
 	// turn off schema dump
 	mig.SchemaPath = ""
 
-	err = mig.Up()
+	count, err := mig.UpTo(0)
 	if err != nil {
 		log.Fatalf("%v", errors.Wrap(err, "running db migrations"))
 	} else {
-		log.Infof("GoTrue migrations applied successfully")
+		log.WithField("count", count).Infof("GoTrue migrations applied successfully")
 	}
 
 	log.Debugf("after status")

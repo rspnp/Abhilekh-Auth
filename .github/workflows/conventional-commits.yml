@@ -6,7 +6,7 @@ on:
       - master
       - release/*
 
-  pull_request_target:
+  pull_request:
     branches:
       - master
       - release/*
@@ -16,28 +16,33 @@ on:
       - reopened
       - ready_for_review
 
+permissions:
+  contents: read
+
 jobs:
   check-conventional-commits:
-    runs-on: ubuntu-latest
-
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    if: github.actor != 'dependabot[bot]' # skip for dependabot PRs
+    env:
+      EVENT: ${{ toJSON(github.event) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           sparse-checkout: |
             .github
 
-      - if: ${{ github.event_name == 'pull_request_target' }}
+      - if: ${{ github.event_name == 'pull_request' }}
         run: |
           set -ex
 
-          node .github/workflows/conventional-commits-lint.js pr <<EOF
-          ${{ toJSON(github.event) }}
-          EOF
+          TMP_FILE=$(mktemp)
+          echo "${EVENT}" > "$TMP_FILE"
+          node .github/workflows/conventional-commits-lint.js pr "${TMP_FILE}"
 
       - if: ${{ github.event_name == 'push' }}
         run: |
           set -ex
 
-          node .github/workflows/conventional-commits-lint.js push <<EOF
-          ${{ toJSON(github.event) }}
-          EOF
+          TMP_FILE=$(mktemp)
+          echo "${EVENT}" > "$TMP_FILE"
+          node .github/workflows/conventional-commits-lint.js push "${TMP_FILE}"

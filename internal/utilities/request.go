@@ -6,28 +6,15 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 
 	"github.com/supabase/auth/internal/conf"
+	"github.com/supabase/auth/internal/sbff"
 )
 
-// GetIPAddress returns the real IP address of the HTTP request.
-//
-// It prefers single-value headers set by a trusted edge proxy — Cloudflare's
-// CF-Connecting-IP, then X-Real-IP — because they carry exactly one
-// authoritative client IP. It falls back to the first entry of the
-// order-sensitive X-Forwarded-For header (which intermediate proxies append
-// to), and finally to the direct connection's RemoteAddr.
-func GetIPAddress(r *http.Request) string {
+func getIPAddressWithXFF(r *http.Request) string {
 	if r.Header != nil {
-		for _, header := range []string{"CF-Connecting-IP", "X-Real-IP"} {
-			if v := strings.TrimSpace(r.Header.Get(header)); v != "" {
-				if parsed := net.ParseIP(v); parsed != nil {
-					return parsed.String()
-				}
-			}
-		}
-
 		xForwardedFor := r.Header.Get("X-Forwarded-For")
 		if xForwardedFor != "" {
 			ips := strings.Split(xForwardedFor, ",")
@@ -55,6 +42,34 @@ func GetIPAddress(r *http.Request) string {
 	}
 
 	return ip
+}
+
+// GetIPAddress returns the real IP address of the HTTP request.
+//
+// Order matters. Everything in this deployment sits behind Cloudflare, so
+// CF-Connecting-IP is the authoritative single-value client IP and is consulted
+// first, then X-Real-IP. Only when neither is present do we fall through to
+// upstream's resolution: its sbff source, then getIPAddressWithXFF, which walks
+// the order-sensitive X-Forwarded-For list and finally RemoteAddr.
+//
+// Layered ahead of upstream's chain rather than replacing it, so the edge-proxy
+// behaviour this fork needs is kept without dropping anything upstream added.
+func GetIPAddress(r *http.Request) string {
+	if r.Header != nil {
+		for _, header := range []string{"CF-Connecting-IP", "X-Real-IP"} {
+			if v := strings.TrimSpace(r.Header.Get(header)); v != "" {
+				if parsed := net.ParseIP(v); parsed != nil {
+					return parsed.String()
+				}
+			}
+		}
+	}
+
+	if sbffAddr, ok := sbff.GetIPAddress(r); ok {
+		return sbffAddr
+	}
+
+	return getIPAddressWithXFF(r)
 }
 
 // GetBodyBytes reads the whole request body properly into a byte array.
@@ -92,6 +107,9 @@ func GetReferrer(r *http.Request, config *conf.GlobalConfiguration) string {
 	return config.SiteURL
 }
 
+var decimalIPAddressPattern = regexp.MustCompile("^[0-9]+$")
+var regularHostname = regexp.MustCompile("^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$")
+
 func IsRedirectURLValid(config *conf.GlobalConfiguration, redirectURL string) bool {
 	if redirectURL == "" {
 		return false
@@ -105,9 +123,30 @@ func IsRedirectURLValid(config *conf.GlobalConfiguration, redirectURL string) bo
 		return true
 	}
 
+	if rerr != nil {
+		// redirect URL is for some reason invalid
+		return false
+	}
+
+	scheme := strings.TrimSuffix(strings.ToLower(refurl.Scheme), ":")
+	isHTTP := scheme == "http" || scheme == "https"
+
+	if decimalIPAddressPattern.MatchString(refurl.Hostname()) {
+		// IP address in decimal form also not allowed in redirects!
+		return false
+	} else if ip := net.ParseIP(refurl.Hostname()); ip != nil {
+		return ip.IsLoopback()
+	} else if isHTTP && !regularHostname.MatchString(refurl.Hostname()) {
+		// hostname uses characters that are not typically used
+		return false
+	}
+
 	// For case when user came from mobile app or other permitted resource - redirect back
 	for _, pattern := range config.URIAllowListMap {
-		if pattern.Match(redirectURL) {
+		// only match without the fragment
+		matchAgainst, _, _ := strings.Cut(redirectURL, "#")
+
+		if pattern.Match(matchAgainst) {
 			return true
 		}
 	}
